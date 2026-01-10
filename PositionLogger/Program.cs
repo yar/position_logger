@@ -1,14 +1,20 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 using Valve.VR;
 
 internal static class Program
 {
-    private const double LogHz = 50.0;
+    private const double LogHz = 90.0;
     private const string OutputFileName = "tracking_log.csv";
     private const string FloatFormat = "G9";
     private const int MaxTimingSamples = 100_000;
+    private const uint WaitableTimerAccess = 0x0002 | 0x00100000;
+    private const uint CreateWaitableTimerHighResolution = 0x00000002;
+    private const uint WaitObject0 = 0x00000000;
+    private const uint WaitFailed = 0xFFFFFFFF;
 
     private static int Main()
     {
@@ -33,6 +39,7 @@ internal static class Program
         writer.WriteLine("timestamp_utc,device_index,device_class,controller_role,position_x,position_y,position_z,rotation_w,rotation_x,rotation_y,rotation_z,pose_valid,tracking_result");
 
         var poses = new TrackedDevicePose_t[(int)OpenVR.k_unMaxTrackedDeviceCount];
+        TryBoostPriorities();
         using var quitEvent = new ManualResetEventSlim(false);
         Console.CancelKeyPress += (_, e) =>
         {
@@ -41,23 +48,17 @@ internal static class Program
         };
 
         Console.WriteLine($"Logging at {LogHz} Hz to {outputPath}");
-        var interval = TimeSpan.FromSeconds(1.0 / LogHz);
         var stopwatch = Stopwatch.StartNew();
-        var nextSample = TimeSpan.Zero;
+        var intervalTicks = (long)Math.Round(Stopwatch.Frequency / LogHz);
+        var nextSampleTicks = stopwatch.ElapsedTicks;
+        var spinThresholdTicks = (long)Math.Round(Stopwatch.Frequency * 0.001);
         var timingSamples = new long[MaxTimingSamples];
         var timingSampleCount = 0;
 
+        using var waitableTimer = CreateHighResolutionTimer();
         while (!quitEvent.IsSet)
         {
-            var now = stopwatch.Elapsed;
-            if (now < nextSample)
-            {
-                var delay = nextSample - now;
-                if (delay > TimeSpan.Zero)
-                {
-                    Thread.Sleep(delay);
-                }
-            }
+            WaitUntil(nextSampleTicks, stopwatch, waitableTimer, spinThresholdTicks, quitEvent);
 
             if (quitEvent.IsSet)
             {
@@ -125,7 +126,7 @@ internal static class Program
             }
 
             writer.Flush();
-            nextSample += interval;
+            nextSampleTicks += intervalTicks;
         }
 
         ReportTimingStats(timingSamples, timingSampleCount);
@@ -222,4 +223,97 @@ internal static class Program
         var stdDev = Math.Sqrt(varianceSum / deltasCount);
         Console.WriteLine($"Timing stats (first {count} samples): avg delta {mean:F3} ms, std dev {stdDev:F3} ms.");
     }
+
+    private static void TryBoostPriorities()
+    {
+        try
+        {
+            Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Priority boost failed: {ex.Message}");
+        }
+    }
+
+    private static SafeWaitHandle? CreateHighResolutionTimer()
+    {
+        var handle = CreateWaitableTimerEx(IntPtr.Zero, null, CreateWaitableTimerHighResolution, WaitableTimerAccess);
+        if (handle == null || handle.IsInvalid)
+        {
+            return null;
+        }
+
+        return handle;
+    }
+
+    private static void WaitUntil(long targetTicks, Stopwatch stopwatch, SafeWaitHandle? waitableTimer, long spinThresholdTicks, ManualResetEventSlim quitEvent)
+    {
+        while (!quitEvent.IsSet)
+        {
+            var nowTicks = stopwatch.ElapsedTicks;
+            var remainingTicks = targetTicks - nowTicks;
+            if (remainingTicks <= 0)
+            {
+                return;
+            }
+
+            if (remainingTicks <= spinThresholdTicks)
+            {
+                while (!quitEvent.IsSet && stopwatch.ElapsedTicks < targetTicks)
+                {
+                    Thread.SpinWait(100);
+                }
+                return;
+            }
+
+            var waitTicks = remainingTicks - spinThresholdTicks;
+            if (waitableTimer == null)
+            {
+                var delay = TimeSpan.FromSeconds(waitTicks / (double)Stopwatch.Frequency);
+                Thread.Sleep(delay);
+                continue;
+            }
+
+            var dueTime = ToRelativeDueTime(waitTicks);
+            if (!SetWaitableTimer(waitableTimer, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false))
+            {
+                Thread.Sleep(TimeSpan.FromSeconds(waitTicks / (double)Stopwatch.Frequency));
+                continue;
+            }
+
+            var waitResult = WaitForSingleObject(waitableTimer.DangerousGetHandle(), 0xFFFFFFFF);
+            if (waitResult == WaitFailed)
+            {
+                Thread.Sleep(TimeSpan.FromSeconds(waitTicks / (double)Stopwatch.Frequency));
+            }
+        }
+    }
+
+    private static long ToRelativeDueTime(long waitTicks)
+    {
+        var wait100Ns = waitTicks * (10_000_000.0 / Stopwatch.Frequency);
+        var dueTime = -(long)Math.Round(wait100Ns);
+        return dueTime == 0 ? -1 : dueTime;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeWaitHandle CreateWaitableTimerEx(
+        IntPtr lpTimerAttributes,
+        string? lpTimerName,
+        uint dwFlags,
+        uint dwDesiredAccess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetWaitableTimer(
+        SafeWaitHandle hTimer,
+        ref long pDueTime,
+        int lPeriod,
+        IntPtr pfnCompletionRoutine,
+        IntPtr lpArgToCompletionRoutine,
+        bool fResume);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
 }
