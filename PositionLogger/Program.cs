@@ -5,9 +5,10 @@ using Valve.VR;
 
 internal static class Program
 {
-    private const double LogHz = 1.0;
+    private const double LogHz = 50.0;
     private const string OutputFileName = "tracking_log.csv";
     private const string FloatFormat = "G9";
+    private const int MaxTimingSamples = 100_000;
 
     private static int Main()
     {
@@ -43,6 +44,8 @@ internal static class Program
         var interval = TimeSpan.FromSeconds(1.0 / LogHz);
         var stopwatch = Stopwatch.StartNew();
         var nextSample = TimeSpan.Zero;
+        var timingSamples = new long[MaxTimingSamples];
+        var timingSampleCount = 0;
 
         while (!quitEvent.IsSet)
         {
@@ -62,6 +65,10 @@ internal static class Program
             }
 
             var timestamp = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+            if (timingSampleCount < timingSamples.Length)
+            {
+                timingSamples[timingSampleCount++] = stopwatch.ElapsedTicks;
+            }
             system.GetDeviceToAbsoluteTrackingPose(ETrackingUniverseOrigin.TrackingUniverseStanding, 0, poses);
 
             for (uint i = 0; i < poses.Length; i++)
@@ -121,6 +128,7 @@ internal static class Program
             nextSample += interval;
         }
 
+        ReportTimingStats(timingSamples, timingSampleCount);
         OpenVR.Shutdown();
         return 0;
     }
@@ -181,5 +189,37 @@ internal static class Program
     private static string FormatFloat(float value)
     {
         return value.ToString(FloatFormat, CultureInfo.InvariantCulture);
+    }
+
+    private static void ReportTimingStats(long[] samples, int count)
+    {
+        if (count < 2)
+        {
+            Console.WriteLine("Timing stats: insufficient samples.");
+            return;
+        }
+
+        var deltasCount = count - 1;
+        var ticksToMs = 1000.0 / Stopwatch.Frequency;
+        double sum = 0.0;
+
+        for (var i = 1; i < count; i++)
+        {
+            var deltaMs = (samples[i] - samples[i - 1]) * ticksToMs;
+            sum += deltaMs;
+        }
+
+        var mean = sum / deltasCount;
+        double varianceSum = 0.0;
+
+        for (var i = 1; i < count; i++)
+        {
+            var deltaMs = (samples[i] - samples[i - 1]) * ticksToMs;
+            var diff = deltaMs - mean;
+            varianceSum += diff * diff;
+        }
+
+        var stdDev = Math.Sqrt(varianceSum / deltasCount);
+        Console.WriteLine($"Timing stats (first {count} samples): avg delta {mean:F3} ms, std dev {stdDev:F3} ms.");
     }
 }
